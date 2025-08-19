@@ -5,15 +5,12 @@ local uv = vim.loop
 local defaults = {
     float = {
         border = "rounded",
-        title = "Mass Rename",
         relative = "editor",
-        width = 0.6,  -- as fraction of editor width
-        height = 0.6, -- as fraction of editor height
-        row = 0.2,    -- top offset as fraction
-        col = 0.2,    -- left offset as fraction
+        width = 0.8,
+        height = 0.8,
+        row = 0.1,
+        col = 0.1,
     },
-    -- whether to show only basenames in the buffer while keeping absolute paths under the hood
-    show_basename = false,
 }
 
 local function cfg()
@@ -31,29 +28,13 @@ local function exists(path)
     return stat ~= nil
 end
 
-local function is_dir(path)
-    local stat = uv.fs_stat(path)
-    return stat and stat.type == "directory"
-end
-
 local function ensure_parent_dir(path)
     local parent = vim.fn.fnamemodify(path, ":h")
     if parent ~= path and parent ~= "" and not exists(parent) then
-        -- Try to create recursively
         vim.fn.mkdir(parent, "p")
     end
 end
 
--- Generate a unique temporary path for cycle-breaking
-local function tmp_for(path)
-    local base = path .. ".~mr~" .. tostring(math.random(100000, 999999))
-    while exists(base) do
-        base = path .. ".~mr~" .. tostring(math.random(100000, 999999))
-    end
-    return base
-end
-
--- Create the floating window + buffer
 local function open_float()
     local buf = vim.api.nvim_create_buf(true, false)
 
@@ -70,7 +51,7 @@ local function open_float()
 
     vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
     vim.api.nvim_set_option_value("buftype", "acwrite", { buf = buf })
-    vim.api.nvim_set_option_value("filetype", "massrename", { buf = buf })
+    vim.api.nvim_set_option_value("filetype", "foil", { buf = buf })
     vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
 
     local win = vim.api.nvim_open_win(buf, true, {
@@ -80,16 +61,16 @@ local function open_float()
         row = row,
         col = col,
         border = c.border,
-        title = c.title,
     })
 
-    -- Oil-like niceties
-    vim.wo[win].number = false
-    vim.wo[win].relativenumber = false
-    vim.wo[win].signcolumn = "no"
-    vim.wo[win].cursorline = true
+    vim.api.nvim_set_option_value("wrap", false, { scope = "local", win = win })
+    vim.api.nvim_set_option_value("conceallevel", 3, { scope = "local", win = win })
+    vim.api.nvim_set_option_value("concealcursor", "nvic", { scope = "local", win = win })
+    vim.api.nvim_set_option_value("number", false, { scope = "local", win = win })
+    vim.api.nvim_set_option_value("relativenumber", false, { scope = "local", win = win })
+    vim.api.nvim_set_option_value("signcolumn", "no", { scope = "local", win = win })
+    vim.api.nvim_set_option_value("cursorline", true, { scope = "local", win = win })
 
-    -- q to close
     vim.keymap.set("n", "q", function()
         if vim.api.nvim_win_is_valid(win) then
             vim.api.nvim_win_close(win, true)
@@ -101,129 +82,179 @@ local function open_float()
     return buf, win
 end
 
--- Diff old->new and compute a rename plan (with cycle handling)
-local function compute_plan(old_paths, new_paths)
-    local ops = {}
-    local src_set = {}
-    local dst_set = {}
-    for i, src in ipairs(old_paths) do
-        local dst = new_paths[i]
-        if src and dst and src ~= dst then
-            ops[#ops + 1] = { src = src, dst = dst }
-            src_set[src] = true
-            dst_set[dst] = true
+local function compute_plan(old_entries, new_entries)
+    local id_count = {}
+    for _, item in ipairs(new_entries) do
+        if item.id then
+            id_count[item.id] = (id_count[item.id] or 0) + 1
         end
     end
 
-    -- Detect conflicts (two entries to same destination)
-    local seen_dst = {}
-    for _, op in ipairs(ops) do
-        if seen_dst[op.dst] then
-            return nil, string.format("duplicate destination: %s", op.dst)
+    local changes = {}
+    local processed_ids = {}
+
+    for _, item in ipairs(new_entries) do
+        if item.id and not processed_ids[item.id] then
+            processed_ids[item.id] = true
+
+            local lines = {}
+            for _, c in ipairs(new_entries) do
+                if c.id == item.id then table.insert(lines, c) end
+            end
+
+            local orig = nil
+            for _, o in ipairs(old_entries) do
+                if o.id == item.id then
+                    orig = o; break
+                end
+            end
+
+            if orig then
+                if #lines == 1 then
+                    local c = lines[1]
+                    if c.path == orig.path then
+                        table.insert(changes, { change = "unchanged", src = orig.path, des = c.path })
+                    else
+                        table.insert(changes, { change = "moved", src = orig.path, des = c.path })
+                    end
+                else
+                    table.insert(changes, { change = "moved", src = orig.path, des = lines[1].path })
+                    for i = 2, #lines do
+                        table.insert(changes, { change = "copied", src = orig.path, des = lines[i].path })
+                    end
+                end
+            else
+                for _, c in ipairs(lines) do
+                    table.insert(changes, { change = "new", src = nil, des = c.path })
+                end
+            end
+        elseif not item.id then
+            table.insert(changes, { change = "new", src = nil, des = item.path })
         end
-        seen_dst[op.dst] = true
     end
 
-    -- Break cycles by renaming to temporary files first if needed
-    -- Strategy: if a destination path is also a source in another op and the dest exists,
-    -- we stage renames: src -> tmp, then tmp -> dst in second phase.
-    local stage1, stage2 = {}, {}
-    local src_lookup = {}
-    for _, op in ipairs(ops) do src_lookup[op.src] = true end
-
-    for _, op in ipairs(ops) do
-        local needs_temp = src_lookup[op.dst] or exists(op.dst)
-        if needs_temp then
-            local tmp = tmp_for(op.dst)
-            stage1[#stage1 + 1] = { src = op.src, dst = tmp, temp = true, final = op.dst }
-            stage2[#stage2 + 1] = { src = tmp, dst = op.dst, temp = false }
-        else
-            stage1[#stage1 + 1] = { src = op.src, dst = op.dst, temp = false }
+    -- Detect deleted items
+    for _, o in ipairs(old_entries) do
+        local exists = false
+        for _, c in ipairs(new_entries) do
+            if c.id == o.id then
+                exists = true; break
+            end
+        end
+        if not exists then
+            table.insert(changes, { change = "deleted", src = o.path, des = nil })
         end
     end
 
-    return vim.list_extend(stage1, stage2)
+    local priority = { copied = 1, moved = 2, deleted = 3, new = 0, unchanged = 0 }
+
+    table.sort(changes, function(a, b)
+        return (priority[a.change] or 0) < (priority[b.change] or 0)
+    end)
+
+    return changes
 end
 
--- Apply a series of rename operations atomically-ish
+local function copy_file(src, dest)
+    local src_fd = uv.fs_open(src, "r", 438) -- 438 = 0666
+    if not src_fd then return end
+
+    local stat = uv.fs_fstat(src_fd)
+    if not stat then
+        uv.fs_close(src_fd)
+        return
+    end
+
+    local data = uv.fs_read(src_fd, stat.size, 0)
+    uv.fs_close(src_fd)
+
+    local dest_fd = uv.fs_open(dest, "w", stat.mode)
+    uv.fs_write(dest_fd, data, 0)
+    uv.fs_close(dest_fd)
+end
+
 local function apply_plan(plan)
     local applied = {}
     for _, op in ipairs(plan) do
-        ensure_parent_dir(op.dst)
-        local ok, err = uv.fs_rename(op.src, op.dst)
-        if not ok then
-            -- rollback best-effort
-            for i = #applied, 1, -1 do
-                local prev = applied[i]
-                uv.fs_rename(prev.dst, prev.src)
+        vim.print(op)
+        if op.change == 'moved' then
+            ensure_parent_dir(op.des)
+            local ok, err = uv.fs_rename(op.src, op.des)
+            if not ok then
+                -- rollback best-effort
+                for i = #applied, 1, -1 do
+                    local prev = applied[i]
+                    uv.fs_rename(prev.des, prev.src)
+                end
+                return false, string.format("rename failed: %s → %s (%s)", op.src, op.des, err or "unknown")
             end
-            return false, string.format("rename failed: %s → %s (%s)", op.src, op.dst, err or "unknown")
+        elseif op.change == 'copied' then
+            copy_file(op.src, op.des)
+        elseif op.change == 'delete' then
+            local ok, err = uv.fs_unlink(op.src)
+            if not ok then
+                print("Failed to delete:", err)
+            end
         end
+
         table.insert(applied, op)
     end
     return true
 end
 
--- Populate buffer with paths (and keep originals in b:massrename_orig)
 local function populate(buf, paths)
-    local show_basename = cfg().show_basename
     local lines = {}
     for _, p in ipairs(paths) do
-        if show_basename then
-            table.insert(lines, vim.fn.fnamemodify(p, ":t"))
-        else
-            table.insert(lines, p)
-        end
+        -- Prepend hidden ID
+        table.insert(lines, "/" .. p.id .. " " .. p.path)
     end
+
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.b[buf].massrename_orig = vim.deepcopy(paths)
-    vim.b[buf].massrename_show_basename = show_basename
+
+    vim.b[buf].foil_orig = vim.deepcopy(paths)
 end
 
 local function on_write(buf)
-    local orig = vim.b[buf].massrename_orig or {}
-    local show_basename = vim.b[buf].massrename_show_basename
+    local orig = vim.b[buf].foil_orig or {}
     local new_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 
-    local new_paths = {}
-    if show_basename then
-        for i, base in ipairs(new_lines) do
-            local old_abs = orig[i]
-            if not old_abs then break end
-            local parent = vim.fn.fnamemodify(old_abs, ":h")
-            new_paths[i] = normalize(parent .. "/" .. base)
-        end
-    else
-        for i, line in ipairs(new_lines) do
-            new_paths[i] = normalize(line)
-        end
+    local new_entries = {}
+    for _, line in ipairs(new_lines) do
+        local id, path = line:match("^/(%d+)%s+(.*)")
+        table.insert(new_entries, { id = id, path = normalize(path) })
     end
 
-    for i, np in ipairs(new_paths) do
-        if np == nil or np == "" then
+    vim.print(new_entries)
+
+    for i, np in ipairs(new_entries) do
+        if np.path == nil or np.path == "" then
             return false, string.format("line %d is empty", i)
         end
-        if is_dir(orig[i]) then
-            return false, "directories not supported yet"
-        end
     end
 
-    local plan, err = compute_plan(orig, new_paths)
+    local plan, err = compute_plan(orig, new_entries)
     if not plan then return false, err end
 
     local ok, err2 = apply_plan(plan)
     if not ok then return false, err2 end
 
-    vim.b[buf].massrename_orig = new_paths
+    vim.b[buf].foil_orig = new_entries
     return true
 end
 
-function M.open_from_list(paths, opts)
+function M.open(paths, opts)
+    local entries = {}
+    for _, p in ipairs(paths) do
+        local id = tostring(math.random(1e9))
+        table.insert(entries, { id = id, path = p })
+    end
+
     M._cfg = vim.tbl_deep_extend("force", defaults, opts or {})
     local buf, win = open_float()
-    populate(buf, paths)
+    populate(buf, entries)
 
-    -- Apply on :w
+    pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
+
     vim.api.nvim_create_autocmd("BufWriteCmd", {
         buffer = buf,
         callback = function()
@@ -235,6 +266,16 @@ function M.open_from_list(paths, opts)
             else
                 pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
                 vim.notify("Mass rename applied", vim.log.levels.INFO)
+            end
+        end,
+    })
+
+    vim.api.nvim_create_autocmd({ "BufLeave", "WinClosed" }, {
+        buffer = buf,
+        once = true,
+        callback = function()
+            if vim.api.nvim_win_is_valid(win) then
+                vim.api.nvim_win_close(win, true)
             end
         end,
     })
@@ -260,7 +301,7 @@ function M.open_from_quickfix(opts)
         vim.notify("Quickfix is empty", vim.log.levels.WARN)
         return
     end
-    return M.open_from_list(files, opts)
+    return M.open(files, opts)
 end
 
 function M.open_from_args(opts)
@@ -277,17 +318,17 @@ function M.open_from_args(opts)
         vim.notify("Arglist is empty", vim.log.levels.WARN)
         return
     end
-    return M.open_from_list(files, opts)
+    return M.open(files, opts)
 end
 
 function M.setup(opts)
     M._cfg = vim.tbl_deep_extend("force", defaults, opts or {})
 
-    vim.api.nvim_create_user_command("FoilQuickfix", function(cmd)
+    vim.api.nvim_create_user_command("FoilQuickfix", function()
         M.open_from_quickfix(M._cfg)
     end, {})
 
-    vim.api.nvim_create_user_command("FoilArgs", function(cmd)
+    vim.api.nvim_create_user_command("FoilArgs", function()
         M.open_from_args(M._cfg)
     end, {})
 end
